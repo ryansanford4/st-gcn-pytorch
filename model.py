@@ -4,40 +4,43 @@ import torch.nn.functional as F
 import torch
 import numpy as np
 
-from layer import GraphConvolution, StandConvolution
+from st_gcn import Model
+from gwnet import gwnet
+from P3D import P3D199, get_optim_policies
 
 class GGCN(nn.Module):
-	def __init__(self, adj, num_v, num_classes, gc_dims, sc_dims, feat_dims, dropout=0.5):
+	def __init__(self, cfg):
 		super(GGCN, self).__init__()
 
-		terminal_cnt = 5
-		actor_cnt = 1
-		adj = adj + torch.eye(adj.size(0)).to(adj).detach()
-		ident = torch.eye(adj.size(0)).to(adj)
-		zeros = torch.zeros(adj.size(0), adj.size(1)).to(adj)
-		self.adj = torch.cat([torch.cat([adj, ident, zeros], 1),
-							  torch.cat([ident, adj, ident], 1),
-							  torch.cat([zeros, ident, adj], 1)], 0).float()
-		self.terminal = nn.Parameter(torch.randn(terminal_cnt, actor_cnt, feat_dims))
+		self.cfg = cfg
 
-		self.gcl = GraphConvolution(gc_dims[0]+feat_dims, gc_dims[1], num_v, dropout=dropout)
-		self.conv= StandConvolution(sc_dims, num_classes, dropout=dropout)
-
-		nn.init.xavier_normal_(self.terminal)
-
-	def forward(self, x):
-		head_la = F.interpolate(torch.stack([self.terminal[0],self.terminal[1]],2), 6)
-		head_ra = F.interpolate(torch.stack([self.terminal[0],self.terminal[2]],2), 6)
-		lw_ra = F.interpolate(torch.stack([self.terminal[3],self.terminal[4]],2), 6)
-		node_features = torch.cat([
-								   (head_la[:,:,:3] + head_ra[:,:,:3])/2,
-								   torch.stack((lw_ra[:,:,2], lw_ra[:,:,1], lw_ra[:,:,0]), 2),
-								   lw_ra[:,:,3:], head_la[:,:,3:], head_ra[:,:,3:]], 2).to(x)
-		x = torch.cat((x, node_features.permute(0,2,1).unsqueeze(1).repeat(1,32,1,1)), 3)
-
-		concat_seq = torch.cat([x[:,:-2], x[:,1:-1], x[:,2:]], 2) # 1, 30, 45, 3
-		multi_conv = self.gcl(self.adj, concat_seq)
-		logit = self.conv(multi_conv)
-		
-		return logit
-		
+		self.p3d = P3D199(pretrained=True, num_classes=cfg.num_activities, dropout=cfg.train_dropout_prob, config=cfg)
+		self.p3d.apply(get_optim_policies)
+		self.maxpool2d = nn.AdaptiveMaxPool2d((None, 1))
+		self.avgpool = nn.AdaptiveMaxPool1d(1)
+		self.fc_drop = nn.Sequential(nn.Linear(2048*self.cfg.crop_size[0]*self.cfg.crop_size[1], 1024), nn.ReLU(), nn.Dropout(cfg.train_dropout_prob))
+		self.fc_cls = nn.Linear(1024, cfg.num_activities)
+		# self.gcn = Model(in_channels=2048, num_class=cfg.num_activities, edge_importance_weighting=False)
+		self.gcn = gwnet(device=torch.device('cuda'), num_nodes=cfg.num_boxes, in_dim=1024, out_dim=cfg.num_activities, blocks=2)
+	
+	def forward(self, x, bbox_in):
+		roi_align = self.p3d(x, bbox_in)
+		if self.cfg.stgcn:
+			roi_align = torch.reshape(roi_align, (-1, 2048*self.cfg.crop_size[0]*self.cfg.crop_size[1]))
+			roi_align = self.fc_drop(roi_align)
+			roi_align = torch.reshape(roi_align, (-1, self.cfg.num_frames, self.cfg.num_boxes, 1024))
+			roi_align = roi_align.permute(0, 3, 2, 1)
+			output = self.gcn(roi_align)
+			# output = self.gcn(roi_align, {"bbox_in": bbox_in, "strategy": 'uniform'})
+		elif self.cfg.roi_align:
+			# output from p3d is [B, C, N*T, H, W]
+			roi_align = torch.reshape(roi_align, (-1, 2048*self.cfg.crop_size[0]*self.cfg.crop_size[1]))
+			roi_align = self.fc_drop(roi_align)
+			roi_align = torch.reshape(roi_align, (-1, self.cfg.num_frames, self.cfg.num_boxes, 1024))
+			roi_align, _ = torch.max(roi_align, dim=2)
+			roi_align = self.fc_cls(roi_align)
+			roi_align = roi_align.permute(0, 2, 1)
+			output = torch.mean(roi_align, dim=-1)
+		else:
+			output = roi_align
+		return output
